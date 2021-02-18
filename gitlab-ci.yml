@@ -1,0 +1,173 @@
+variables:
+  IMAGE_PREVIOUS: "$CI_REGISTRY_IMAGE/$CI_COMMIT_REF_SLUG:$CI_COMMIT_BEFORE_SHA"
+  IMAGE_LATEST: "$CI_REGISTRY_IMAGE/$CI_COMMIT_REF_SLUG:latest"
+  IMAGE_TAGGED: "$CI_REGISTRY_IMAGE/$CI_COMMIT_REF_SLUG:$CI_COMMIT_SHA"
+
+stages:
+  - build
+  - test
+  - deploy
+  - cleanup
+
+build:
+  stage: build
+  image: docker:stable
+  services:
+    - docker:stable-dind
+  script:
+    - >
+      docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
+      "$CI_REGISTRY"
+    - >
+      docker image pull --quiet "$IMAGE_PREVIOUS"
+      || docker image pull --quiet "$IMAGE_LATEST"
+      || echo "No previously cached image found."
+    - >
+      docker build --pull
+      --cache-from "$IMAGE_PREVIOUS"
+      --cache-from "$IMAGE_LATEST"
+      --tag "$IMAGE_TAGGED"
+      --tag "$IMAGE_LATEST"
+      .
+    - docker push "$IMAGE_TAGGED"
+    - docker push "$IMAGE_LATEST"
+
+test:
+  stage: test
+  image: docker:stable
+  services:
+    - docker:stable-dind
+  script:
+    - >
+      docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
+      "$CI_REGISTRY"
+    - docker run "$IMAGE_TAGGED" test
+  rules:
+    - if: '$TEST_ENABLED =~ /^true$/i'
+      when: manual
+    - if: '$TEST_ENABLED =~ /^auto$/i'
+  variables:
+    GIT_STRATEGY: none
+
+.deploy:
+  stage: deploy
+  image: alpine/k8s:1.18.2
+  script:
+    - >
+      kubectl get namespace "$KUBE_NAMESPACE"
+      || kubectl create namespace "$KUBE_NAMESPACE"
+    - >
+      kubectl -n "$KUBE_NAMESPACE"
+      create secret docker-registry "gitlab-registry-$CI_PROJECT_PATH_SLUG"
+      -o yaml --dry-run
+      --docker-server="$CI_REGISTRY"
+      --docker-username="${CI_DEPLOY_USER:-$CI_REGISTRY_USER}"
+      --docker-password="${CI_DEPLOY_PASSWORD:-$CI_REGISTRY_PASSWORD}"
+      --docker-email="$GITLAB_USER_EMAIL"
+      | kubectl replace -n "$KUBE_NAMESPACE" -f - --force
+    - |
+      for helm_values_file in ${!HELM_VALUES_*}; do
+        helm_values_args+=(-f "${!helm_values_file}")
+      done
+    - |
+      if [ "${HELM_DEBUG,,}" == "true" ]; then
+        helm_values_args+=(--debug)
+      else
+        helm_values_args+=(--atomic)
+      fi
+    - |
+      if [ -z "$HELM_CHART" ]; then
+        export HELM_CHART=./chart
+      fi
+    - >
+      helm upgrade ${helm_values_args[@]} -i -n "$KUBE_NAMESPACE"
+      --set image.repository="$CI_REGISTRY_IMAGE/$CI_COMMIT_REF_SLUG"
+      --set image.secrets[0].name="gitlab-registry-$CI_PROJECT_PATH_SLUG"
+      --set-string image.tag="$CI_COMMIT_SHA"
+      $CI_PROJECT_NAME $HELM_CHART
+
+deploy_production:
+  extends: .deploy
+  rules:
+    - if: '$CI_KUBERNETES_ACTIVE != "true" || $CI_COMMIT_BRANCH != "master"'
+      when: never
+    - if: '$DEPLOY_ENABLED =~ /^true$/i'
+      when: manual
+    - if: '$DEPLOY_ENABLED =~ /^auto$/i'
+  environment:
+    name: production
+    url: $DEPLOY_URL
+    on_stop: cleanup_production
+
+deploy_staging:
+  extends: .deploy
+  rules:
+    - if: '$CI_KUBERNETES_ACTIVE != "true" || $CI_COMMIT_BRANCH != "master"'
+      when: never
+    - if: '$DEPLOY_ENABLED =~ /^true$/i'
+      when: manual
+    - if: '$DEPLOY_ENABLED =~ /^auto$/i'
+  environment:
+    name: staging
+    url: $DEPLOY_URL
+    on_stop: cleanup_staging
+
+deploy_testing:
+  extends: .deploy
+  rules:
+    - if: '$CI_KUBERNETES_ACTIVE != "true" || $CI_COMMIT_BRANCH == "master"'
+      when: never
+    - if: '$DEPLOY_ENABLED =~ /^true$/i'
+      when: manual
+    - if: '$DEPLOY_ENABLED =~ /^auto$/i'
+  environment:
+    name: testing/$CI_COMMIT_REF_NAME
+    url: $DEPLOY_URL
+    on_stop: cleanup_testing
+
+.cleanup:
+  stage: cleanup
+  image: alpine/k8s:1.18.2
+  script:
+    - kubectl delete namespace "$KUBE_NAMESPACE"
+  variables:
+    GIT_STRATEGY: none
+
+cleanup_production:
+  extends: .cleanup
+  rules:
+    - if: '$CI_KUBERNETES_ACTIVE != "true" || $CI_COMMIT_BRANCH != "master"'
+      when: never
+    - if: '$DEPLOY_ENABLED =~ /^true$/i || $DEPLOY_ENABLED =~ /^auto$/i'
+      when: manual
+  needs:
+    - deploy_production
+  environment:
+    name: production
+    action: stop
+
+cleanup_staging:
+  extends: .cleanup
+  rules:
+    - if: '$CI_KUBERNETES_ACTIVE != "true" || $CI_COMMIT_BRANCH != "master"'
+      when: never
+    - if: '$DEPLOY_ENABLED =~ /^true$/i || $DEPLOY_ENABLED =~ /^auto$/i'
+      when: manual
+  needs:
+    - deploy_staging
+  environment:
+    name: staging
+    action: stop
+
+cleanup_testing:
+  extends: .cleanup
+  rules:
+    - if: '$CI_KUBERNETES_ACTIVE != "true" || $CI_COMMIT_BRANCH == "master"'
+      when: never
+    - if: '$DEPLOY_ENABLED =~ /^true$/i || $DEPLOY_ENABLED =~ /^auto$/i'
+      when: manual
+  needs:
+    - deploy_testing
+  environment:
+    name: testing/$CI_COMMIT_REF_NAME
+    action: stop
